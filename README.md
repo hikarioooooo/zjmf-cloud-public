@@ -32,10 +32,16 @@
    - 只装管理后台：选“主控”。
    - 只装运行虚拟机的服务器：选“仅计算节点”。
    - 一台机器两个都装：选“合并安装”。
-5. 如果提示输入授权码，可填写下面这串，并保存好：
+5. 授权码填写 **32 位大写 MD5**，只包含数字 `0–9` 和大写字母 `A–F`。下面这串**只是格式示例**，请使用自己生成的结果：
 
    ```text
    7D1C62A93F804BE69A5D28C041E7B936
+   ```
+
+   首次安装可以在服务器执行下面这条命令，复制输出的 32 位结果，作为授权码并保存。已有授权码的继续使用原来的：
+
+   ```bash
+   cat /proc/sys/kernel/random/uuid | md5sum | cut -c 1-32 | tr 'a-f' 'A-F'
    ```
 
 6. 等到脚本全部结束，保存后台地址、账号和密码。出现 `STOPPED` 就先处理报错，不要当作安装成功。
@@ -46,13 +52,45 @@
 ## 第四步：节点断线或没授权时怎么处理
 
 1. 重新登录节点，查看 `/var/log/zjmf-bootstrap/` 里的最新安装日志；如果还在安装，先等它结束。
-2. 确认节点已经装好后，打开安装站首页，展开“安装断线了，或者节点没有授权”。
-3. 复制里面的补配命令，到节点服务器执行，填写与主控相同的授权站地址。
-4. 回到主控查看节点。仍然没授权时，点一次“下发授权”。
-5. 平时保持主控、节点和授权站正常运行，不用每周手动续签。
+2. 确认节点已经装好后，在**节点服务器**执行下面的补配命令。把 `https://install.example.com` 换成你的**安装站地址**，把 `https://auth.example.com/` 换成主控正在使用的**授权站地址**：
+
+   ```bash
+   wget 'https://install.example.com/install-zjmf-cloud_new' -O zjmf-node-repair.sh && bash zjmf-node-repair.sh --node-only --auth-url 'https://auth.example.com/'
+   ```
+
+3. 回到主控查看节点。仍然没授权时，点一次“下发授权”。
+4. 平时保持主控、节点和授权站正常运行，不用每周手动续签。
 
 ## 第五步：以后更新或更换授权站
 
-1. 更新授权站：先备份，再覆盖新版 `index.php`，保留原来的 `.zjmf-data` 文件夹。
-2. 更换授权站地址：在主控和节点上分别重新运行安装命令，填写新地址。
-3. 已经安装 3.9.42 的，也可以用同一条命令处理授权。**3.9.22 等旧版先不要运行，这不是旧版升级命令。**
+### 只更新授权站文件
+
+1. 先备份授权站的 `index.php` 和 `.zjmf-data` 文件夹。
+2. 覆盖新版 `index.php`，保留原来的 `.zjmf-data`。
+3. 打开 `你的授权站地址/health`，确认显示 `status: 200`。
+
+### 更换授权站地址
+
+下面的 `https://install.example.com` 换成你的**安装站地址**，`https://new-auth.example.com/` 换成**新授权站地址**。选业务空闲时操作，切换前先备份主控数据库和配置。
+
+1. 先搭好新授权站，暂时保留旧授权站。在**主控服务器**执行下面命令检查新站，检查通过后再继续：
+
+   ```bash
+   wget 'https://install.example.com/install-zjmf-cloud_new' -O zjmf-auth-change.sh && bash zjmf-auth-change.sh --auth-test --auth-url 'https://new-auth.example.com/'
+   ```
+
+2. 在同一台**主控服务器**执行下面命令，切换到新地址。主控和节点装在同一台的，也用这一条；按提示填写后台登录信息：
+
+   ```bash
+   bash zjmf-auth-change.sh --existing --auth-url 'https://new-auth.example.com/'
+   ```
+
+3. 在**每一台单独安装的节点服务器**上执行下面命令，填写同一个新地址：
+
+   ```bash
+   wget 'https://install.example.com/install-zjmf-cloud_new' -O zjmf-auth-change.sh && bash zjmf-auth-change.sh --node-only --auth-url 'https://new-auth.example.com/'
+   ```
+
+4. 回到后台，逐个确认节点“已连接”且授权正常，再停用旧授权站。
+
+**以上命令用于已安装的 3.9.42。3.9.22 等旧版先不要运行，这不是旧版升级命令。**
