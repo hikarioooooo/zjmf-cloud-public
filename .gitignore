@@ -1,0 +1,13 @@
+/.zjmf-data/
+/.zjmf-fix/
+/.env
+/backups/
+/logs/
+__pycache__/
+*.pyc
+*.log
+*.sql
+*.sql.gz
+*.bak
+.DS_Store
+Thumbs.db

@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+SOURCE=__SITE_URL__
+EXISTING=0
+NODE_ONLY=0
+CHECK=0
+LICENSE_TEST=0
+AUTH_TEST=0
+AUTH_URL=''
+SKIP_PLUGINS=0
+BACKEND=''
+UPSTREAM_ARGS=()
+while (($#)); do
+    case "$1" in
+        --source) SOURCE="${2:?--source requires a URL}"; shift 2 ;;
+        --auth-url) AUTH_URL="${2:?--auth-url requires a URL}"; shift 2 ;;
+        --existing) EXISTING=1; shift ;;
+        --node-only) NODE_ONLY=1; EXISTING=1; shift ;;
+        --license-test) LICENSE_TEST=1; shift ;;
+        --auth-test) AUTH_TEST=1; shift ;;
+        --check) CHECK=1; EXISTING=1; shift ;;
+        --skip-plugins) SKIP_PLUGINS=1; shift ;;
+        --backend-url) BACKEND="${2:?--backend-url requires a URL}"; shift 2 ;;
+        -t|--trunk) UPSTREAM_ARGS+=('-t'); shift ;;
+        -l|--light) UPSTREAM_ARGS+=('-l'); shift ;;
+        -h|--help)
+            printf '%s\n' 'Usage: ./install-zjmf-cloud_new [--auth-url URL] [--auth-test] [--existing] [--node-only] [--license-test] [--check] [--skip-plugins] [--backend-url URL] [--trunk] [--light]'
+            exit 0 ;;
+        *) printf 'Unknown option: %s\n' "$1" >&2; exit 2 ;;
+    esac
+done
+[[ $(id -u) == 0 ]] || { printf '%s\n' '请使用 root 运行。' >&2; exit 1; }
+[[ $(uname -m) == x86_64 ]] || { printf '%s\n' 'Only x86_64 is supported.' >&2; exit 1; }
+if [[ "$NODE_ONLY" == 1 ]]; then
+    [[ "$LICENSE_TEST" == 0 && ${#UPSTREAM_ARGS[@]} == 0 ]] || { printf '%s\n' '--node-only cannot be combined with original-installer options.' >&2; exit 2; }
+    [[ -f /usr/local/zjmf/php/version.txt && -f /usr/local/zjmf/bin/cloud-control ]] || { printf '%s\n' 'NODE_RECOVERY_STOPPED: 未检测到已安装的计算节点；补配模式不会执行原版安装。' >&2; exit 1; }
+fi
+if [[ "$AUTH_TEST" == 0 ]]; then
+    command -v flock >/dev/null 2>&1 || { printf '%s\n' '缺少 flock（util-linux），请先安装后重试。' >&2; exit 1; }
+    exec 9>/run/zjmf-bootstrap.lock
+    flock -n 9 || { printf '%s\n' 'INSTALLATION_IN_PROGRESS: 已有安装或补配正在运行，请先查看 /var/log/zjmf-bootstrap/ 日志，勿重复运行。' >&2; exit 1; }
+fi
+case "$SOURCE" in http://*|https://*) ;; *) printf '%s\n' 'Invalid source URL.' >&2; exit 1;; esac
+SOURCE="${SOURCE%/}/"
+STAGE=$(mktemp -d /tmp/zjmf-bootstrap.XXXXXXXX)
+cleanup() {
+    local result=$?
+    if [[ -n "${BOOTSTRAP_LOG:-}" ]]; then
+        printf 'BOOTSTRAP_EXIT=%s\n安装日志：%s\n' "$result" "$BOOTSTRAP_LOG" || true
+    fi
+    case "$STAGE" in /tmp/zjmf-bootstrap.*) rm -rf -- "$STAGE";; esac
+    return "$result"
+}
+trap cleanup EXIT
+fetch() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --connect-timeout 15 --max-time 300 "$1" -o "$2"
+    elif command -v wget >/dev/null 2>&1; then
+        wget --timeout=30 --tries=2 "$1" -O "$2"
+    else
+        printf '%s\n' 'curl or wget is required.' >&2; return 1
+    fi
+}
+# Validate the user-owned authorization service before installing anything.
+# CentOS 7 has Python 2; CentOS Stream 8 has platform-python before python3.
+BOOTSTRAP_PYTHON=''
+for interpreter in python3 /usr/libexec/platform-python python python2; do
+    if command -v "$interpreter" >/dev/null 2>&1 && "$interpreter" -c 'import json,hashlib' >/dev/null 2>&1; then
+        BOOTSTRAP_PYTHON="$interpreter"; break
+    fi
+done
+[[ -n "$BOOTSTRAP_PYTHON" ]] || { printf '%s\n' '缺少 Python，请先安装 Python 2.7 或 Python 3。' >&2; exit 1; }
+auth_fetch() {
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --connect-timeout 10 --max-time 30 "$1" -o "$2"
+    elif command -v wget >/dev/null 2>&1; then
+        wget --timeout=15 --tries=1 "$1" -O "$2"
+    else
+        printf '%s\n' 'curl or wget is required.' >&2; return 1
+    fi
+}
+validate_auth_station() {
+    local selected
+    selected=$("$BOOTSTRAP_PYTHON" - "$1" <<'PY'
+from __future__ import print_function
+import re,sys
+try:
+    from urllib.parse import urlsplit,urlunsplit
+except ImportError:
+    from urlparse import urlsplit,urlunsplit
+try:
+    value=sys.argv[1].strip()
+    if not value or len(value)>950 or re.search(r'[\s\\]',value):raise ValueError('Address must be a complete HTTP(S) URL without spaces')
+    parsed=urlsplit(value)
+    if parsed.scheme not in ('http','https') or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:raise ValueError('Use http:// or https:// and omit credentials, query and fragment')
+    if parsed.port is not None and not 1<=parsed.port<=65535:raise ValueError('Invalid port')
+    if not re.match(r'^[A-Za-z0-9./_~:%\[\]-]*$',parsed.netloc+parsed.path):raise ValueError('Invalid domain or path')
+    print(urlunsplit((parsed.scheme,parsed.netloc,parsed.path.rstrip('/')+'/','','')))
+except ValueError as error:
+    print(str(error),file=sys.stderr);sys.exit(1)
+PY
+    ) || return 1
+    auth_fetch "${selected}client-config" "$STAGE/selected-auth-config.json" || return 1
+    "$BOOTSTRAP_PYTHON" - "$STAGE/selected-auth-config.json" <<'PY' || return 1
+from __future__ import print_function
+import hashlib,json,sys
+try:
+    with open(sys.argv[1],'rb') as source:raw=source.read(262145)
+    if len(raw)>262144:raise ValueError('Authorization station response is too large')
+    config=json.loads(raw.decode('utf-8'))
+    if not isinstance(config,dict) or config.get('status')!=200 or config.get('service')!='zjmf-cloud-auth' or config.get('version')!='3.9.42' or config.get('quota')!=9999:raise ValueError('Deploy the matching Cloud 3.9.42 authorization-site package')
+    public=config.get('public_key','').encode('utf-8')
+    if not public.startswith(b'-----BEGIN PUBLIC KEY-----') or len(public)>273 or hashlib.sha256(public).hexdigest()!=config.get('public_key_sha256'):raise ValueError('Invalid authorization station public key')
+    node_public=config.get('node_public_key','').encode('utf-8')
+    if config.get('node_authorization_version')!=1 or len(node_public)!=451 or hashlib.sha256(node_public).hexdigest()!=config.get('node_public_key_sha256'):raise ValueError('请更新自建授权站 index.php：缺少 3.9.42 节点授权接口')
+    if config.get('expires')!='2038-12-31 23:59:59' or len(config.get('plugins',[]))!=10:raise ValueError('Authorization station entitlement policy mismatch')
+except (ValueError,TypeError,AttributeError,IOError) as error:
+    print(str(error),file=sys.stderr);sys.exit(1)
+PY
+    auth_fetch "${selected}app/api/auth" "$STAGE/selected-auth-entry.json" || return 1
+    "$BOOTSTRAP_PYTHON" - "$STAGE/selected-auth-entry.json" <<'PY' || return 1
+from __future__ import print_function
+import json,sys
+try:
+    with open(sys.argv[1],'rb') as source:raw=source.read(262145)
+    if len(raw)>262144:raise ValueError('Authorization response is too large')
+    reply=json.loads(raw.decode('utf-8'))
+    if not isinstance(reply,dict) or reply.get('status')!=200 or reply.get('professional') is not True or reply.get('version')!='3.9.42':raise ValueError('Installation authorization endpoint is not ready')
+except (ValueError,TypeError,IOError) as error:
+    print(str(error),file=sys.stderr);sys.exit(1)
+PY
+    AUTH_URL="$selected"
+}
+AUTH_WAS_PROVIDED=0
+[[ -z "$AUTH_URL" ]] || AUTH_WAS_PROVIDED=1
+printf '%s\n' '请先部署本包的独立授权站。安装前校验和安装后的授权均使用你输入的地址。'
+while :; do
+    if [[ "$AUTH_WAS_PROVIDED" == 0 ]]; then
+        if ! { exec 3<>/dev/tty; } 2>/dev/null; then
+            printf '%s\n' '需要交互终端输入自建授权站地址；自动运行可使用 --auth-url URL。' >&2; exit 1
+        fi
+        printf '%s' '请输入你的自建授权站地址（如 https://auth.example.com/）: ' >&3
+        IFS= read -r AUTH_URL <&3 || { printf '%s\n' '未输入授权站地址，已停止。' >&2; exit 1; }
+    fi
+    if validate_auth_station "$AUTH_URL"; then
+        printf '授权站校验通过：%s\n' "$AUTH_URL"
+        break
+    fi
+    printf '%s\n' '授权站未通过校验。请确认地址和配套源码、PHP、伪静态配置正确。' >&2
+    [[ "$AUTH_WAS_PROVIDED" == 0 ]] || exit 1
+done
+[[ "$AUTH_WAS_PROVIDED" == 1 ]] || exec 3>&-
+if [[ "$AUTH_TEST" == 1 ]]; then
+    printf 'AUTH_STATION_VERIFIED: %s\n' "$AUTH_URL"
+    exit 0
+fi
+# Keep installation and its final steps running if the compute installer resets
+# networking and the SSH terminal disappears. Ctrl-C still cancels the run.
+# The relay keeps a root-only log and stops writing to a disconnected terminal.
+# BEGIN TERMINAL_RELAY
+trap '' HUP
+LOG_DIRECTORY=/var/log/zjmf-bootstrap
+install -d -m 700 "$LOG_DIRECTORY"
+BOOTSTRAP_LOG=$(mktemp "$LOG_DIRECTORY/install-XXXXXXXX.log")
+chmod 600 "$BOOTSTRAP_LOG"
+printf '安装日志：%s（仅 root 可读；断线后可查看执行结果）\n' "$BOOTSTRAP_LOG"
+exec 4>&1
+exec > >("$BOOTSTRAP_PYTHON" -c '
+from __future__ import print_function
+import os,signal,sys
+signal.signal(signal.SIGHUP,signal.SIG_IGN)
+console=True
+with open(sys.argv[1],"ab",0) as log:
+    while True:
+        data=os.read(0,65536)
+        if not data:break
+        log.write(data)
+        if console:
+            try:
+                pending=data
+                while pending:
+                    count=os.write(4,pending)
+                    if count<=0:raise OSError("Console closed")
+                    pending=pending[count:]
+            except OSError:
+                console=False
+' "$BOOTSTRAP_LOG" 9>&-) 2>&1
+exec 4>&-
+# END TERMINAL_RELAY
+# Original installation has its own interactive choices; stdin stays on the terminal.
+if [[ ! -f /home/zjmf/dashboard/www/.build-meta/release.env && ! -f /usr/local/zjmf/php/version.txt ]]; then
+    [[ "$EXISTING" == 0 ]] || { printf '%s\n' 'Original installation is missing.' >&2; exit 1; }
+    printf '%s\n' 'Downloading the pinned installer with self-hosted front authorization...'
+    fetch "${SOURCE}other/install-original" "$STAGE/install-original"
+    printf '%s  %s\n' 'ae8cac2b0e901b69d1b06e828d7d219c8a0328301750f90eb0e828e1c3cc1946' "$STAGE/install-original" | sha256sum -c -
+    # The official installer validates the code before installing PHP.
+    # Fill only the reserved license-endpoint field; other downloads stay unchanged.
+    INSTALL_AUTH_URL="${AUTH_URL}app/api/auth"
+    URL_BYTES=$(printf '%s' "$INSTALL_AUTH_URL" | wc -c)
+    [[ "$URL_BYTES" -gt 0 && "$URL_BYTES" -lt 1024 ]] || { printf '%s\n' 'Authorization URL is too long.' >&2; exit 1; }
+    dd if=/dev/zero of="$STAGE/install-original" bs=1 seek=19510272 count=1024 conv=notrunc status=none
+    printf '%s' "$INSTALL_AUTH_URL" | dd of="$STAGE/install-original" bs=1 seek=19510272 conv=notrunc status=none
+    if [[ "$LICENSE_TEST" == 1 ]]; then
+        # Hard exit at the successful license-check return, before installation.
+        printf '\351\322\366\256\002\220\220' | dd of="$STAGE/install-original" bs=1 seek=8321897 conv=notrunc status=none
+    fi
+    chmod 700 "$STAGE/install-original"
+    [[ -r /dev/tty ]] || { printf '%s\n' 'The official installer needs an interactive terminal.' >&2; exit 1; }
+    # Keep the generated credentials private and reuse them for this same run.
+    # The log is removed with the stage directory when the bootstrap exits.
+    INSTALLER_LOG="$STAGE/official-install.log"
+    (umask 077; : > "$INSTALLER_LOG")
+    if "$STAGE/install-original" "${UPSTREAM_ARGS[@]}" </dev/tty 9>&- 2>&1 | tee "$INSTALLER_LOG" 9>&-; then
+        :
+    else
+        ORIGINAL_STATUS=$?
+        printf '原版安装退出（状态 %s），本次尚未完成自动授权。\n' "$ORIGINAL_STATUS" >&2
+        exit "$ORIGINAL_STATUS"
+    fi
+    if [[ "$LICENSE_TEST" == 1 ]]; then
+        printf '%s\n' 'LICENSE_TEST_ONLY: stopped before installing the master or applying its client patches.'
+        exit 0
+    fi
+else
+    [[ "$LICENSE_TEST" == 0 ]] || { printf '%s\n' '--license-test is only for an uninstalled test machine.' >&2; exit 1; }
+    printf '%s\n' 'Existing installation found; the official installer will not be rerun.'
+fi
+if ! command -v python3 >/dev/null 2>&1; then
+    [[ "$CHECK" == 0 ]] || { printf '%s\n' 'python3 is required for check mode.' >&2; exit 1; }
+    command -v yum >/dev/null 2>&1 || { printf '%s\n' 'Install python3 first.' >&2; exit 1; }
+    yum install -y python3
+fi
+fetch "${SOURCE}site.json" "$STAGE/site.json"
+mapfile -t SETTINGS < <(python3 - "$STAGE/site.json" <<'PY'
+import json,sys
+c=json.load(open(sys.argv[1]))
+if c.get('product_version')!='3.9.42':raise SystemExit('Unsupported package policy')
+for k in ['client_package','client_sha256']:print(c[k])
+PY
+)
+[[ ${#SETTINGS[@]} == 2 ]] || { printf '%s\n' 'Invalid site.json.' >&2; exit 1; }
+PACKAGE=${SETTINGS[0]}
+HASH=${SETTINGS[1]}
+[[ "$HASH" =~ ^[0-9a-f]{64}$ ]] || { printf '%s\n' 'Invalid package checksum.' >&2; exit 1; }
+[[ "$PACKAGE" == other/*.tar.gz && "$PACKAGE" != *'..'* ]] || { printf '%s\n' 'Invalid package path.' >&2; exit 1; }
+fetch "${SOURCE}${PACKAGE}" "$STAGE/client.tar.gz"
+printf '%s  %s\n' "$HASH" "$STAGE/client.tar.gz" | sha256sum -c -
+python3 - "$STAGE/client.tar.gz" "$STAGE" <<'PY'
+import pathlib,sys,tarfile
+with tarfile.open(sys.argv[1],'r:gz') as archive:
+    members=archive.getmembers()
+    for m in members:
+        p=pathlib.PurePosixPath(m.name)
+        if p.is_absolute() or '..' in p.parts or not (m.isfile() or m.isdir()):
+            raise SystemExit('Unsafe client archive')
+    archive.extractall(sys.argv[2],members=members)
+PY
+ARGS=(--auth-url "$AUTH_URL")
+[[ -z "${INSTALLER_LOG:-}" ]] || ARGS+=(--installer-log "$INSTALLER_LOG")
+[[ "$CHECK" == 0 ]] || ARGS+=(--check)
+[[ "$SKIP_PLUGINS" == 0 ]] || ARGS+=(--skip-plugins)
+[[ -z "$BACKEND" ]] || ARGS+=(--backend-url "$BACKEND")
+printf '正在接入你的自建授权站 %s 并验证后台权益……\n' "$AUTH_URL"
+HAS_MASTER=0
+HAS_NODE=0
+[[ ! -f /home/zjmf/dashboard/www/.build-meta/release.env ]] || HAS_MASTER=1
+[[ ! -f /usr/local/zjmf/php/version.txt || ! -f /usr/local/zjmf/bin/cloud-control ]] || HAS_NODE=1
+[[ "$NODE_ONLY" == 0 ]] || HAS_MASTER=0
+[[ "$HAS_MASTER" == 1 || "$HAS_NODE" == 1 ]] || { printf '%s\n' '没有检测到已完成安装的主控或计算节点。' >&2; exit 1; }
+if [[ "$HAS_NODE" == 1 ]]; then
+    NODE_ARGS=(--auth-url "$AUTH_URL")
+    [[ "$CHECK" == 0 ]] || NODE_ARGS+=(--check)
+    python3 "$STAGE/client/node_client.py" "${NODE_ARGS[@]}" 9>&-
+    [[ "$CHECK" == 1 ]] || systemctl enable cloud-control
+    systemctl is-enabled --quiet cloud-control
+fi
+if [[ "$HAS_MASTER" == 1 ]]; then
+    python3 "$STAGE/client/client.py" "${ARGS[@]}" 9>&-
+    [[ "$CHECK" == 1 ]] || systemctl enable cloudgo-worker
+    systemctl is-active --quiet cloudgo-worker
+    systemctl is-enabled --quiet cloudgo-worker
+    printf '%s\n' 'NODE_AUTO_RENEWAL_READY: 主控原生节点续签服务已运行并设置开机启动，请保持主控、节点和授权站正常通信。'
+fi
+if [[ "$NODE_ONLY" == 1 && "$CHECK" == 0 ]]; then
+    printf '%s\n' 'NODE_RECOVERY_PREPARED: 节点补配完成，续签由主控自动处理。请确认主控使用同一授权站且节点已连接；尚未获得授权时，可在主控执行“下发授权”作为补救。'
+fi

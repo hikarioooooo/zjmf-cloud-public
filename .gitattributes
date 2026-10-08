@@ -1,0 +1,19 @@
+* text=auto eol=lf
+*.php text eol=lf
+*.py text eol=lf
+*.md text eol=lf
+*.sh text eol=lf
+*.pem text eol=lf
+install-zjmf-cloud_new text eol=lf
+other/authorize-cloud text eol=lf
+other/extension text eol=lf
+*.so binary
+*.zip binary
+*.gz binary
+other/install-original binary
+other/check_main binary
+
+# Preserve the exact bytes shared with the pinned client archive.
+other/client/front_patch.py -text
+other/client/go_key_patch.py -text
+other/client/target.pem -text
